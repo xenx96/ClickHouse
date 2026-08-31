@@ -1,0 +1,91 @@
+<test profile_all_queries="1" run_all_queries="1">
+    <settings>
+        <iceberg_metadata_log_level>none</iceberg_metadata_log_level>
+    </settings>
+
+    <!-- READ suite over the CI-attached `tpch_ice10` Iceberg dataset (`lineitem`: 60M rows, 84
+         monthly partitions, one data file each). Nothing is built or dropped: the dataset is
+         shared with `iceberg_suite_tpch.xml`, which owns the plain scan/join/aggregation
+         coverage; this suite probes the read-path aspects the TPC-H queries cannot isolate:
+         metadata cost, the pruning layers, PREWHERE, in-file push-down, parallelism and table
+         resolution. -->
+
+    <!-- point_lookup_warm: single-day predicate prunes to one data file via partition and
+         per-file min/max stats, metadata served from the cache. -->
+    <query>SELECT count(), sum(l_extendedprice) FROM tpch_ice10.lineitem WHERE l_shipdate = toDate('1994-06-15')</query>
+
+    <!-- point_lookup_cold: the same lookup with the metadata cache off, so the diff against the
+         warm variant is the metadata.json parse and the manifest Avro decode. -->
+    <query>SELECT count(), sum(l_extendedprice) FROM tpch_ice10.lineitem WHERE l_shipdate = toDate('1994-06-15') SETTINGS use_iceberg_metadata_files_cache = 0</query>
+
+    <!-- partition_prune_month: filter aligned with the month partition transform; the signal is
+         `IcebergPartitionPrunedFiles` ~ 83. -->
+    <query>SELECT count(), sum(l_quantity) FROM tpch_ice10.lineitem WHERE l_shipdate &gt;= toDate('1995-01-01') AND l_shipdate &lt; toDate('1995-02-01') SETTINGS use_iceberg_partition_pruning = 1</query>
+
+    <!-- minmax_prune_edge: the last shipping day lives in the last file only, the rest are
+         skipped via per-file min/max stats; the signal is `IcebergMinMaxIndexPrunedFiles` ~ 83. -->
+    <query>SELECT count() FROM tpch_ice10.lineitem WHERE l_shipdate = toDate('1998-12-01')</query>
+
+    <!-- prune_negative_control: the predicate spans every file's range, nothing prunes; the walk
+         over all manifest entries is paid in every run. -->
+    <query>SELECT count(), min(l_shipdate) FROM tpch_ice10.lineitem WHERE l_shipdate &gt;= toDate('1990-01-01')</query>
+
+    <!-- trivial_count: no predicate; answerable from snapshot-level row counts without touching
+         a single data file. -->
+    <query>SELECT count() FROM tpch_ice10.lineitem</query>
+
+    <!-- join_fact_dim_mergetree: Iceberg fact joined with the MergeTree dimension holding the
+         same data, the right side bounded to ~6 months of orders; measures the cross-engine
+         join path. -->
+    <query>SELECT count() FROM tpch_ice10.lineitem AS l INNER JOIN tpch10.orders AS o ON l.l_orderkey = o.o_orderkey WHERE o.o_orderdate &lt; toDate('1992-06-01')</query>
+
+    <!-- join_fact_dim_iceberg: the same join with both sides on Iceberg, so the diff against the
+         MergeTree variant isolates the data-lake read path from the join itself. -->
+    <query>SELECT count() FROM tpch_ice10.lineitem AS l INNER JOIN tpch_ice10.orders AS o ON l.l_orderkey = o.o_orderkey WHERE o.o_orderdate &lt; toDate('1992-06-01')</query>
+
+    <!-- columns_narrow: full scan decoding 2 of 16 columns; Parquet column pruning on the
+         classic revenue expression. -->
+    <query>SELECT sum(l_extendedprice * (1 - l_discount)) FROM tpch_ice10.lineitem</query>
+
+    <!-- columns_wide: the same full scan forced to decode every column; the diff against the
+         narrow variant is the column-count scaling of the Parquet decode. -->
+    <query>SELECT count() FROM tpch_ice10.lineitem WHERE NOT ignore(*)</query>
+
+    <!-- pushdown_off: selective `l_orderkey` range with every in-file filter layer disabled; the
+         whole table is decoded and filtered in the engine. `l_orderkey` grows monotonically with
+         the insert order, so the matching rows are clustered in a few row groups. -->
+    <query>SELECT count(), sum(l_quantity) FROM tpch_ice10.lineitem WHERE l_orderkey BETWEEN 10000000 AND 10100000 SETTINGS input_format_parquet_filter_push_down = 0, input_format_parquet_page_filter_push_down = 0</query>
+
+    <!-- pushdown_rowgroup: row-group min/max statistics only. -->
+    <query>SELECT count(), sum(l_quantity) FROM tpch_ice10.lineitem WHERE l_orderkey BETWEEN 10000000 AND 10100000 SETTINGS input_format_parquet_filter_push_down = 1, input_format_parquet_page_filter_push_down = 0</query>
+
+    <!-- pushdown_page: row-group plus page-level pruning, the finest granularity. -->
+    <query>SELECT count(), sum(l_quantity) FROM tpch_ice10.lineitem WHERE l_orderkey BETWEEN 10000000 AND 10100000 SETTINGS input_format_parquet_filter_push_down = 1, input_format_parquet_page_filter_push_down = 1</query>
+
+    <!-- prewhere_off: a ~4%-selective filter with PREWHERE disabled; both columns are fully
+         decoded before filtering. -->
+    <query>SELECT sum(l_extendedprice), count() FROM tpch_ice10.lineitem WHERE l_quantity &lt; 2 SETTINGS optimize_move_to_prewhere = 0</query>
+
+    <!-- prewhere_on: the same query with the filter moved to PREWHERE on the object-storage read
+         path, so `l_extendedprice` is decoded only for the surviving rows. -->
+    <query>SELECT sum(l_extendedprice), count() FROM tpch_ice10.lineitem WHERE l_quantity &lt; 2 SETTINGS optimize_move_to_prewhere = 1</query>
+
+    <!-- threads_1: one year (12 files) of the revenue scan on a single thread; the baseline of
+         the parallelism pair. -->
+    <query>SELECT sum(l_extendedprice * (1 - l_discount)) FROM tpch_ice10.lineitem WHERE l_shipdate &gt;= toDate('1994-01-01') AND l_shipdate &lt; toDate('1995-01-01') SETTINGS max_threads = 1</query>
+
+    <!-- threads_16: the same scan on 16 threads; the ratio against threads_1 is the file-level
+         parallelization efficiency of the Iceberg source. -->
+    <query>SELECT sum(l_extendedprice * (1 - l_discount)) FROM tpch_ice10.lineitem WHERE l_shipdate &gt;= toDate('1994-01-01') AND l_shipdate &lt; toDate('1995-01-01') SETTINGS max_threads = 16</query>
+
+    <!-- table_function_resolution: the point lookup through the `icebergLocal` table function;
+         every run pays the table resolution and schema inference that the attached-table variant
+         amortizes. The function does not resolve relative paths against `user_files`, so the
+         absolute path is built from `system.server_settings`, which keeps it portable across
+         servers. -->
+    <query>SELECT count(), sum(l_extendedprice) FROM icebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/tpch_ice_sf10/lineitem/') WHERE l_shipdate = toDate('1994-06-15')</query>
+
+    <!-- limit_early_exit: reader startup and cancellation; the scan must open only the first
+         data file and stop after the first thousand wide rows. -->
+    <query>SELECT * FROM tpch_ice10.lineitem LIMIT 1000</query>
+</test>
